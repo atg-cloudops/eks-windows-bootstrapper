@@ -53,19 +53,3 @@ param(
 )
 
 $ErrorActionPreference = 'STOP'
-Start-Transcript -Path C:\Start-EKSBootstrap.log -Append
-
-$env:CLUSTER_NAME = $EKSClusterName
-$env:DNS_CLUSTER_IP = $DNSClusterIP
-$env:ProgramFiles = $programFilesDirectory
-$env:ProgramData = $programDataDirectory
-$env:API_VERSION_AUTHENTICATION = $apiVersionAuthentication
-$env:CONTAINER_RUNTIME = $containerRuntime
-$env:KUBELET_VERSION = $kubeletVersion
-$env:EKS_PAUSE_IMAGE = $eksPauseImage
-$env:KUBELET_EXTRA_ARGS = $kubeletExtraArgs
-$env:KUBE_PROXY_EXTRA_ARGS = $kubeProxyExtraArgs
-
-& $PSScriptRoot\EKS-Windows-Bootstrapper.exe
-
-Stop-Transcript
