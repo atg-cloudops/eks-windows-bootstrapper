@@ -56,19 +56,26 @@ public class BootstrapperService : BackgroundService
         stopWatch.Start();
 
         var userData = string.Empty;
-        var attempts = 0;
+        var stopwatch = Stopwatch.StartNew();
         _logger.LogInformation("Waiting for userdata...");
-        while (attempts < 60)
+        while (stopwatch.Elapsed < TimeSpan.FromMinutes(1))
         {
-
-            userData = Amazon.Util.EC2InstanceMetadata.UserData;
-            if (!string.IsNullOrEmpty(userData))
+            try
             {
-                _logger.LogInformation($"Userdata received after {attempts}");
-                break;
+                userData = Amazon.Util.EC2InstanceMetadata.UserData;
+                if (!string.IsNullOrEmpty(userData))
+                {
+                    _logger.LogInformation("Userdata received, took {0} ms", stopwatch.ElapsedMilliseconds);
+                    break;
+                }
+                await Task.Delay(200);
             }
-            await Task.Delay(1000);
+            catch (Exception ex)
+            {
+                _logger.LogError($"An error occurred while retrieving userdata: {ex.Message}, Retrying...");
+            }
         }
+        stopwatch.Stop();
         _logger.LogInformation($"Userdata: {userData}");
         if (string.IsNullOrEmpty(userData))
         {
