@@ -8,11 +8,31 @@ The EKS Windows Bootstrapper is a fast and efficient tool for bootstrapping Wind
 - Seamless integration with Karpenter for automatic node scaling
 - Easy to use and configure
 
-## Usage
+## Installation
 
 Use AWS Image Builder to create a custom AMI with the boostrapper installed. You can use the AMIs in a Karpenter Ec2NodeClass.
 
-- [Image Builder Instructions](https://github.com/atg-cloudops/eks-windows-bootstrapper/wiki)
+```
+name: Install EKS Windows Bootstrapper
+description: Installs the EKS Windows Bootstrapper on the Windows node
+schemaVersion: 1.0
+
+phases:
+  - name: build
+    steps:
+      - name: InstallEksWindowsBootstrapper
+        action: ExecutePowerShell
+        inputs:
+          commands:
+            - |
+              Invoke-WebRequest -Uri 'https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.29.1/Install-Service.ps1' -OutFile 'Install-Service.ps1'; 
+              .\Install-Service.ps1; 
+              Remove-Item 'Install-Service.ps1';
+```
+
+Create a new AWS Image builder component with the above content and apply this component to your AWS EKS Windows node recipe.
+
+The output AMI can be used with karpenter or regular cluster autoscaler. No further setup is needed.
 
 ## Prerequisites
 
