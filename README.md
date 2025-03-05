@@ -24,7 +24,7 @@ phases:
         inputs:
           commands:
             - |
-              Invoke-WebRequest -Uri 'https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.30.0/Install-Service.ps1' -OutFile 'Install-Service.ps1'; 
+              Invoke-WebRequest -Uri 'https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.32.0/Install-Service.ps1' -OutFile 'Install-Service.ps1'; 
               .\Install-Service.ps1; 
               Remove-Item 'Install-Service.ps1';
 ```
