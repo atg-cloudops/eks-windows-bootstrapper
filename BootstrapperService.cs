@@ -83,10 +83,10 @@ public class BootstrapperService : BackgroundService
             return;
         }
 
-        clusterName = Regex.Match(userData, "-EKSClusterName '([^']+)'")?.Groups[1]?.Value ?? throw new ArgumentException("Cluster name was not found in userdata, exiting");
-        dnsClusterIP = Regex.Match(userData, "-DNSClusterIP '([^']+)'")?.Groups[1]?.Value ?? throw new ArgumentException("DnsClusterIP was not found in userdata, exiting");
-        kubeletExtraArgs = Regex.Match(userData, "-KubeletExtraArgs '([^']+)'")?.Groups[1]?.Value ?? string.Empty;
-        kubeProxyExtraArgs = Regex.Match(userData, "-KubeProxyExtraArgs '([^']+)'").Groups[1].Value ?? string.Empty;
+        clusterName = Regex.Match(userData, "-EKSClusterName\\s+(['\"])(.*?)\\1")?.Groups[2]?.Value ?? throw new ArgumentException("Cluster name was not found in userdata, exiting");
+        dnsClusterIP = Regex.Match(userData, "-DNSClusterIP\\s+(['\"])(.*?)\\1")?.Groups[2]?.Value ?? throw new ArgumentException("DnsClusterIP was not found in userdata, exiting");
+        kubeletExtraArgs = Regex.Match(userData, "-KubeletExtraArgs\\s+(['\"])(.*?)\\1")?.Groups[2]?.Value ?? string.Empty;
+        kubeProxyExtraArgs = Regex.Match(userData, "-KubeProxyExtraArgs\\s+(['\"])(.*?)\\1").Groups[2].Value ?? string.Empty;
 
         _logger.LogInformation($"Extracted parameters: ClusterName: {clusterName}, DnsClusterIP: {dnsClusterIP}, KubeletExtraArgs: {kubeletExtraArgs}, KubeProxyExtraArgs: {kubeProxyExtraArgs}");
 
