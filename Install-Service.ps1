@@ -1,5 +1,5 @@
 param(
-    $ReleaseUrl = "https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.33.0",
+    $ReleaseUrl = "https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.34.0",
     [switch]$SkipSsmConfiguration,
     [switch]$ShutdownOnCriticalFailure
 )
