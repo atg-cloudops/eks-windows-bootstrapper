@@ -24,7 +24,7 @@ phases:
         inputs:
           commands:
             - |
-              Invoke-WebRequest -Uri 'https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.33.0/Install-Service.ps1' -OutFile 'Install-Service.ps1'; 
+              Invoke-WebRequest -Uri 'https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.34.0/Install-Service.ps1' -OutFile 'Install-Service.ps1'; 
               .\Install-Service.ps1; 
               Remove-Item 'Install-Service.ps1';
 ```
@@ -43,6 +43,34 @@ Remove all the windows configuration components in the oobeSystem pass in unatte
   </settings>
 ```
 With these components removed, you will have to ensure your images are set to the right culture/timezone before the AMI is created - Windows won't be reconfigured on first boot.
+
+### Auto Shutdown on Failure
+
+By default, if the bootstrapper encounters a critical failure (e.g. HNS network creation fails), it will throw an exception and the node will be left in a broken state in the cluster.
+
+Enabling `ShutdownOnCriticalFailure` causes the node to immediately shut itself down on a critical failure instead. When using Karpenter, this is the recommended setting — Karpenter's default behaviour is to delete and recreate a node if the underlying instance is shut down, which effectively gives the bootstrap process another attempt on a fresh node.
+
+To enable this, pass the `-ShutdownOnCriticalFailure` switch when running the install script:
+
+```
+.\Install-Service.ps1 -ShutdownOnCriticalFailure
+```
+
+Or when using AWS Image Builder:
+
+```
+Invoke-WebRequest -Uri 'https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.34.0/Install-Service.ps1' -OutFile 'Install-Service.ps1'; 
+.\Install-Service.ps1 -ShutdownOnCriticalFailure; 
+Remove-Item 'Install-Service.ps1';
+```
+
+Alternatively, you can enable it manually by setting `ShutdownOnCriticalFailure` to `"true"` in `appsettings.json`:
+
+```json
+{
+    "ShutdownOnCriticalFailure": "true"
+}
+```
 
 #### View Logs
 If you have access to the node, you can view the boostrapper logs with (in powershell):

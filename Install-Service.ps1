@@ -1,6 +1,7 @@
 param(
-    $ReleaseUrl = "https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.33.0",
-    [switch]$SkipSsmConfiguration
+    $ReleaseUrl = "https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.34.0",
+    [switch]$SkipSsmConfiguration,
+    [switch]$ShutdownOnCriticalFailure
 )
 Write-Host "EKS Windows Bootstrapper Installation Script Started at $(Get-Date -Format "yyyy-MM-ddTHH:mm:ss")"
 
@@ -8,6 +9,11 @@ Write-Host "EKS Windows Bootstrapper Installation Script Started at $(Get-Date -
 if(-not [string]::IsNullOrEmpty($ReleaseUrl)) {
     Invoke-WebRequest -Uri "$ReleaseUrl/EKS-Windows-Bootstrapper.exe" -OutFile "C:\EKS-Windows-Bootstrapper.exe"
     Invoke-WebRequest -Uri "$ReleaseUrl/appsettings.json" -OutFile "C:\appsettings.json"
+    if ($ShutdownOnCriticalFailure) {
+        $config = Get-Content "C:\appsettings.json" -Raw | ConvertFrom-Json
+        $config.ShutdownOnCriticalFailure = "true"
+        $config | ConvertTo-Json -Depth 10 | Set-Content "C:\appsettings.json" -NoNewline
+    }
     Invoke-WebRequest -Uri "$ReleaseUrl/Start-EKSBootstrap.ps1" -OutFile "C:\Program Files\Amazon\EKS\Start-EKSBootstrap.ps1"
     
     # Install the bootstrapper

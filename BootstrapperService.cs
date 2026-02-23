@@ -3,7 +3,10 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -11,6 +14,32 @@ namespace EKS_Windows_Bootstrapper;
 
 public class BootstrapperService : BackgroundService
 {
+    private const string ServiceNameKubelet = "kubelet";
+    private const string ServiceNameKubeProxy = "kube-proxy";
+    private const string ServiceNameContainerd = "containerd";
+    private const string ResolvDirectory = @"c:\etc";
+    private const string CniConfigFileName = "vpc-bridge.conf";
+    private const string VpcBridgeNetworkType = "L2Bridge";
+    private const string CniSpecVersion = "0.4.0";
+    private const string CniNetworkName = "vpc";
+    private const string CniNetworkType = "vpc-bridge";
+    private const string ContainerdPipeEndpoint = "npipe:////./pipe/containerd-containerd";
+    private const int UserdataPollIntervalMs = 200;
+    private const int UserdataTimeoutMinutes = 1;
+    private const int AwsRetryMaxAttempts = 5;
+    private const int AwsRetryDelayMs = 2000;
+
+    // Route targets for AWS/metadata and related services (link-local)
+    private static readonly string[] MetadataRouteAddresses = { "169.254.169.254", "169.254.169.250", "169.254.169.251", "169.254.169.249", "169.254.169.123", "169.254.169.253" };
+
+    [DllImport("vmcompute.dll")]
+    private static extern void HNSCall(
+        [MarshalAs(UnmanagedType.LPWStr)] string method,
+        [MarshalAs(UnmanagedType.LPWStr)] string path,
+        [MarshalAs(UnmanagedType.LPWStr)] string request,
+        [MarshalAs(UnmanagedType.LPWStr)] out string response);
+
+    readonly bool _shutdownOnCriticalFailure;
     string? vpcCIDRRange;
     string? subnetCIDRRange;
     string? excludedSnatCIDRsEnvVar;
@@ -45,9 +74,10 @@ public class BootstrapperService : BackgroundService
     const int SERVICE_FAILURE_THIRD_DELAY_MS = 60000;
     ILogger<BootstrapperService> _logger;
 
-    public BootstrapperService(ILogger<BootstrapperService> logger)
+    public BootstrapperService(ILogger<BootstrapperService> logger, IConfiguration configuration)
     {
         _logger = logger;
+        _shutdownOnCriticalFailure = bool.TryParse(configuration["ShutdownOnCriticalFailure"], out var shutdownOnCritical) && shutdownOnCritical;
     }
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -58,7 +88,7 @@ public class BootstrapperService : BackgroundService
         var userData = string.Empty;
         var stopwatch = Stopwatch.StartNew();
         _logger.LogInformation("Waiting for userdata...");
-        while (stopwatch.Elapsed < TimeSpan.FromMinutes(1))
+        while (stopwatch.Elapsed < TimeSpan.FromMinutes(UserdataTimeoutMinutes))
         {
             try
             {
@@ -68,7 +98,11 @@ public class BootstrapperService : BackgroundService
                     _logger.LogInformation("Userdata received, took {0} ms", stopwatch.ElapsedMilliseconds);
                     break;
                 }
-                await Task.Delay(200);
+                await Task.Delay(UserdataPollIntervalMs, stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
             }
             catch (Exception ex)
             {
@@ -86,7 +120,7 @@ public class BootstrapperService : BackgroundService
         clusterName = Regex.Match(userData, "-EKSClusterName\\s+(['\"])(.*?)\\1")?.Groups[2]?.Value ?? throw new ArgumentException("Cluster name was not found in userdata, exiting");
         dnsClusterIP = Regex.Match(userData, "-DNSClusterIP\\s+(['\"])(.*?)\\1")?.Groups[2]?.Value ?? throw new ArgumentException("DnsClusterIP was not found in userdata, exiting");
         kubeletExtraArgs = Regex.Match(userData, "-KubeletExtraArgs\\s+(['\"])(.*?)\\1")?.Groups[2]?.Value ?? string.Empty;
-        kubeProxyExtraArgs = Regex.Match(userData, "-KubeProxyExtraArgs\\s+(['\"])(.*?)\\1").Groups[2].Value ?? string.Empty;
+        kubeProxyExtraArgs = Regex.Match(userData, "-KubeProxyExtraArgs\\s+(['\"])(.*?)\\1")?.Groups[2]?.Value ?? string.Empty;
 
         _logger.LogInformation($"Extracted parameters: ClusterName: {clusterName}, DnsClusterIP: {dnsClusterIP}, KubeletExtraArgs: {kubeletExtraArgs}, KubeProxyExtraArgs: {kubeProxyExtraArgs}");
 
@@ -128,20 +162,16 @@ public class BootstrapperService : BackgroundService
         var ec2Client = new Amazon.EC2.AmazonEC2Client();
         var client = new Amazon.EKS.AmazonEKSClient();
 
-        var clusterTask = client.DescribeClusterAsync(new Amazon.EKS.Model.DescribeClusterRequest
-        {
-            Name = clusterName
-        });
-        var instanceInfoTask = ec2Client.DescribeInstancesAsync(new Amazon.EC2.Model.DescribeInstancesRequest
-        {
-            InstanceIds = new List<string> { instanceId },
-
-        });
+        var clusterTask = DescribeClusterWithRetryAsync(client, clusterName!, stoppingToken);
+        var instanceInfoTask = DescribeInstancesWithRetryAsync(ec2Client, instanceId, stoppingToken);
         region = Amazon.Util.EC2InstanceMetadata.Region.SystemName;
         eniMACAddress = Amazon.Util.EC2InstanceMetadata.GetData("/mac");
         vpcCIDRRange = Amazon.Util.EC2InstanceMetadata.GetData($"/network/interfaces/macs/{eniMACAddress}/vpc-ipv4-cidr-block");
         subnetCIDRRange = Amazon.Util.EC2InstanceMetadata.GetData($"/network/interfaces/macs/{eniMACAddress}/subnet-ipv4-cidr-block");
-        subnetMaskBits = subnetCIDRRange.Split("/", 2)[1];
+        var subnetParts = subnetCIDRRange?.Split("/", 2, StringSplitOptions.None);
+        if (subnetParts == null || subnetParts.Length != 2)
+            throw new ArgumentException("Subnet CIDR range was not found or invalid in instance metadata (expected format: prefix/maskBits).", nameof(subnetCIDRRange));
+        subnetMaskBits = subnetParts[1];
         internalIp = Amazon.Util.EC2InstanceMetadata.PrivateIpAddress;
 
         var cluster = await clusterTask;
@@ -156,28 +186,60 @@ public class BootstrapperService : BackgroundService
         _logger.LogInformation($"Gathered system configuration in {stopWatch.ElapsedMilliseconds} ms");
         stopWatch.Reset();
 
-        //await Task.Delay(Timeout.Infinite, stoppingToken);
-
         _logger.LogInformation("Configuring EKS Windows Node");
         stopWatch.Start();
         await Task.WhenAll(
-            ConfigureHNS(),
-            startScript == null ? StartService("containerd") : ExecutePowershellScript(startScript),
+            ConfigureHNS(stoppingToken),
+            startScript == null ? StartService(ServiceNameContainerd, stoppingToken) : ExecutePowershellScript(startScript, stoppingToken),
             UpdateKubeConfig(),
             UpdateEksCniConfig(),
             UpdateKubeletConfig(),
-            RegisterKubernetesServices(),
+            RegisterKubernetesServices(stoppingToken),
             GenerateResolvConf()
         );
         await Task.WhenAll(
-            StartService("kubelet"),
-            StartService("kube-proxy")
+            StartService(ServiceNameKubelet, stoppingToken),
+            StartService(ServiceNameKubeProxy, stoppingToken)
         );
 
         stopWatch.Stop();
         _logger.LogInformation($"EKS Windows Node Configured in {stopWatch.ElapsedMilliseconds} ms");
     }
 
+
+    async Task<Amazon.EKS.Model.DescribeClusterResponse> DescribeClusterWithRetryAsync(Amazon.EKS.IAmazonEKS client, string clusterName, CancellationToken cancellationToken)
+    {
+        for (var attempt = 1; attempt <= AwsRetryMaxAttempts; attempt++)
+        {
+            try
+            {
+                return await client.DescribeClusterAsync(new Amazon.EKS.Model.DescribeClusterRequest { Name = clusterName }, cancellationToken);
+            }
+            catch (Exception ex) when (attempt < AwsRetryMaxAttempts)
+            {
+                _logger.LogWarning(ex, "DescribeCluster attempt {Attempt} failed, retrying in {DelayMs} ms.", attempt, AwsRetryDelayMs);
+                await Task.Delay(AwsRetryDelayMs, cancellationToken);
+            }
+        }
+        return await client.DescribeClusterAsync(new Amazon.EKS.Model.DescribeClusterRequest { Name = clusterName }, cancellationToken);
+    }
+
+    async Task<Amazon.EC2.Model.DescribeInstancesResponse> DescribeInstancesWithRetryAsync(Amazon.EC2.IAmazonEC2 ec2Client, string instanceId, CancellationToken cancellationToken)
+    {
+        for (var attempt = 1; attempt <= AwsRetryMaxAttempts; attempt++)
+        {
+            try
+            {
+                return await ec2Client.DescribeInstancesAsync(new Amazon.EC2.Model.DescribeInstancesRequest { InstanceIds = new List<string> { instanceId } }, cancellationToken);
+            }
+            catch (Exception ex) when (attempt < AwsRetryMaxAttempts)
+            {
+                _logger.LogWarning(ex, "DescribeInstances attempt {Attempt} failed, retrying in {DelayMs} ms.", attempt, AwsRetryDelayMs);
+                await Task.Delay(AwsRetryDelayMs, cancellationToken);
+            }
+        }
+        return await ec2Client.DescribeInstancesAsync(new Amazon.EC2.Model.DescribeInstancesRequest { InstanceIds = new List<string> { instanceId } }, cancellationToken);
+    }
 
     IEnumerable<string> GetGatewayIpAddresses()
     {
@@ -200,13 +262,13 @@ public class BootstrapperService : BackgroundService
     {
         if (string.IsNullOrEmpty(vpcCIDRRange))
         {
-            throw new ArgumentNullException("VpcCIDRRange");
+            throw new ArgumentNullException(nameof(vpcCIDRRange));
         }
         List<string> combinedCIDRRange = [vpcCIDRRange];
         if (!string.IsNullOrEmpty(excludedSnatCIDRsEnvVar))
         {
             _logger.LogInformation("Excluding environment variable specified CIDR ranges for SNAT in CNI config");
-            combinedCIDRRange.AddRange(excludedSnatCIDRsEnvVar.Split(","));
+            combinedCIDRRange.AddRange(excludedSnatCIDRsEnvVar.Split(',').Select(s => s.Trim()).Where(s => !string.IsNullOrEmpty(s)));
         }
 
         return combinedCIDRRange;
@@ -216,15 +278,15 @@ public class BootstrapperService : BackgroundService
     {
         if (string.IsNullOrEmpty(clusterCertificateAuthorityData))
         {
-            throw new ArgumentNullException("clusterCertificateAuthorityData");
+            throw new ArgumentNullException(nameof(clusterCertificateAuthorityData));
         }
         if (string.IsNullOrEmpty(eksClusterCACertFile))
         {
-            throw new ArgumentNullException("eksClusterCACertFile");
+            throw new ArgumentNullException(nameof(eksClusterCACertFile));
         }
         if (string.IsNullOrEmpty(kubeConfigFile))
         {
-            throw new ArgumentNullException("kubeConfigFile");
+            throw new ArgumentNullException(nameof(kubeConfigFile));
         }
         var caFileWriteTask = File.WriteAllBytesAsync(eksClusterCACertFile, Convert.FromBase64String(clusterCertificateAuthorityData));
         var kubeConfig = $@"
@@ -263,84 +325,67 @@ public class BootstrapperService : BackgroundService
 
     async Task UpdateEksCniConfig()
     {
-        var CNIConfigFile = $"{cniConfigDir}\\vpc-bridge.conf";
-        List<string> SNATExcludedCIDRs = GetCombinedSNATExclusionList();
+        var cniConfigFilePath = Path.Combine(cniConfigDir ?? string.Empty, CniConfigFileName);
+        List<string> snatExcludedCIDRs = GetCombinedSNATExclusionList();
         var dnsSuffixList = new[] { "{%namespace%}.svc.cluster.local", "svc.cluster.local", "cluster.local" };
-        var cniSpecVersion = "0.4.0";
-        var additionalCNIConf = @"
-        ""disableCheck"": true,
-    ";
-
-        var CNIConfig = $@"
-    {{
-        ""cniVersion"": ""{cniSpecVersion}"",
-        ""name"": ""vpc"",
-        ""type"": ""vpc-bridge"",
-        ""capabilities"": {{""portMappings"": true}},{additionalCNIConf}
-        ""eniMACAddress"": ""{eniMACAddress}"",
-        ""eniIPAddresses"": [""{internalIp}/{subnetMaskBits}""],
-        ""gatewayIPAddress"": ""{gatewayIpAddresses?.FirstOrDefault()}"",
-        ""vpcCIDRs"": [{string.Join(',', SNATExcludedCIDRs.Select(cidr => $"\"{cidr}\""))}],
-        ""serviceCIDR"": ""{serviceCIDR}"",
-        ""dns"": {{
-            ""nameservers"": [""{dnsClusterIP}""],
-            ""search"": [{string.Join(',', dnsSuffixList.Select(suffix => $"\"{suffix}\""))}]
-        }}
-    }}
-    ";
-
-        await File.WriteAllTextAsync(CNIConfigFile, CNIConfig, Encoding.ASCII);
+        var cniConfig = new CniConfig
+        {
+            CniVersion = CniSpecVersion,
+            Name = CniNetworkName,
+            Type = CniNetworkType,
+            Capabilities = new CniCapabilities { PortMappings = true },
+            DisableCheck = true,
+            EniMACAddress = eniMACAddress ?? string.Empty,
+            EniIPAddresses = new[] { $"{internalIp}/{subnetMaskBits}" },
+            GatewayIPAddress = gatewayIpAddresses?.FirstOrDefault(),
+            VpcCIDRs = snatExcludedCIDRs,
+            ServiceCIDR = serviceCIDR ?? string.Empty,
+            Dns = new CniDnsConfig
+            {
+                Nameservers = new[] { dnsClusterIP ?? string.Empty },
+                Search = dnsSuffixList
+            }
+        };
+        var json = JsonSerializer.Serialize(cniConfig, BootstrapperJsonContext.Default.CniConfig);
+        await File.WriteAllTextAsync(cniConfigFilePath, json, Encoding.ASCII);
     }
 
     async Task UpdateKubeletConfig()
     {
         if (string.IsNullOrEmpty(kubeletConfigFile))
         {
-            throw new ArgumentNullException("KubeletConfigFile");
+            throw new ArgumentNullException(nameof(kubeletConfigFile));
         }
-        var KubeletConfig = @"
-    {
-        ""kind"": ""KubeletConfiguration"",
-        ""apiVersion"": ""kubelet.config.k8s.io/v1beta1"",
-        ""address"": ""0.0.0.0"",
-        ""authentication"": {
-            ""anonymous"": {
-                ""enabled"": false
+        var kubeletConfig = new KubeletConfiguration
+        {
+            Kind = "KubeletConfiguration",
+            ApiVersion = "kubelet.config.k8s.io/v1beta1",
+            Address = "0.0.0.0",
+            Authentication = new KubeletAuthentication
+            {
+                Anonymous = new KubeletAnonymous { Enabled = false },
+                Webhook = new KubeletWebhook { CacheTTL = "2m0s", Enabled = true },
+                X509 = new KubeletX509 { ClientCAFile = eksClusterCACertFile }
             },
-            ""webhook"": {
-                ""cacheTTL"": ""2m0s"",
-                ""enabled"": true
+            Authorization = new KubeletAuthorization
+            {
+                Mode = "Webhook",
+                Webhook = new KubeletAuthWebhook { CacheAuthorizedTTL = "5m0s", CacheUnauthorizedTTL = "30s" }
             },
-            ""x509"": {
-                ""clientCAFile"": """ + eksClusterCACertFile?.Replace("\\", "\\\\") + @"""
-            }
-        },
-        ""authorization"": {
-            ""mode"": ""Webhook"",
-            ""webhook"": {
-                ""cacheAuthorizedTTL"": ""5m0s"",
-                ""cacheUnauthorizedTTL"": ""30s""
-            }
-        },
-        ""clusterDomain"": ""cluster.local"",
-        ""hairpinMode"": ""hairpin-veth"",
-        ""cgroupDriver"": ""cgroupfs"",
-        ""cgroupRoot"": ""/"",
-        ""featureGates"": {
-            ""RotateKubeletServerCertificate"": true
-        },
-        ""serializeImagePulls"": false,
-        ""serverTLSBootstrap"": true,
-        ""clusterDNS"": [
-            """ + dnsClusterIP + @"""
-        ]
-    }
-    ";
-
-        await File.WriteAllTextAsync(kubeletConfigFile, KubeletConfig, Encoding.ASCII);
+            ClusterDomain = "cluster.local",
+            HairpinMode = "hairpin-veth",
+            CgroupDriver = "cgroupfs",
+            CgroupRoot = "/",
+            FeatureGates = new Dictionary<string, bool> { ["RotateKubeletServerCertificate"] = true },
+            SerializeImagePulls = false,
+            ServerTLSBootstrap = true,
+            ClusterDNS = new[] { dnsClusterIP ?? string.Empty }
+        };
+        var json = JsonSerializer.Serialize(kubeletConfig, BootstrapperJsonContext.Default.KubeletConfiguration);
+        await File.WriteAllTextAsync(kubeletConfigFile, json, Encoding.ASCII);
     }
 
-    async Task RegisterKubernetesServices()
+    async Task RegisterKubernetesServices(CancellationToken cancellationToken)
     {
         var kubeletArgs = new StringBuilder();
         kubeletArgs.Append(" --config=\\\"" + kubeletConfigFile + "\\\"");
@@ -353,72 +398,71 @@ public class BootstrapperService : BackgroundService
         kubeletArgs.Append(" --enable-debugging-handlers");
         kubeletArgs.Append(" --cgroups-per-qos=false");
         kubeletArgs.Append(" --enforce-node-allocatable=\\\"\\\"");
-        kubeletArgs.Append(" --container-runtime-endpoint=\\\"npipe:////./pipe/containerd-containerd\\\"");
+        kubeletArgs.Append(" --container-runtime-endpoint=\\\"" + ContainerdPipeEndpoint + "\\\"");
         kubeletArgs.Append(" --image-credential-provider-bin-dir=\\\"" + credentialProviderDir + "\\\"");
         kubeletArgs.Append(" --image-credential-provider-config=\\\"" + credentialProviderConfig + "\\\"");
         kubeletArgs.Append(" --node-ip=" + internalIp);
 
         kubeletArgs.Append(" " + kubeletExtraArgs?.Replace("\"", "\\\""));
 
-        // Register the windows service
-        var kubeletServiceName = "kubelet";
-        var kubeProxyServiceName = "kube-proxy";
-
         var kubeletTask = Task.Run(() =>
         {
-            using var process = Process.Start(new ProcessStartInfo("sc.exe")
-            {
-                Arguments = $"create \"{kubeletServiceName}\" binPath= \"\\\"{serviceHostExe}\\\" {kubeletServiceName} \\\"{kubelet}\\\" {kubeletArgs}\" start= demand",
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            });
-            process?.WaitForExit();
-            using var configure = Process.Start("sc.exe", $"failure {kubeletServiceName} reset={SERVICE_FAILURE_COUNT_RESET_SEC} actions=\"restart/{SERVICE_FAILURE_FIRST_DELAY_MS} + /restart/{SERVICE_FAILURE_SECOND_DELAY_MS} + /restart/{SERVICE_FAILURE_THIRD_DELAY_MS}\"");
-            configure?.WaitForExit();
-            using var failure = Process.Start("sc.exe", $"failureflag {kubeletServiceName} 1");
-            failure?.WaitForExit();
-        });
-
+            RunScCreate(ServiceNameKubelet, $"\\\"{serviceHostExe}\\\" {ServiceNameKubelet} \\\"{kubelet}\\\" {kubeletArgs}");
+            RunScFailure(ServiceNameKubelet);
+            RunScFailureFlag(ServiceNameKubelet);
+        }, cancellationToken);
 
         var kubeProxyArgs = string.Join(" ", new[]
         {
-        $"--kubeconfig=\\\"{kubeConfigFile}\\\"",
-        "--v=1",
-        "--proxy-mode=kernelspace",
-        $"--hostname-override=\\\"{privateDnsName}\\\"",
-        $"--cluster-cidr=\\\"{vpcCIDRRange}\\\"",
-        kubeProxyExtraArgs
-    });
+            $"--kubeconfig=\\\"{kubeConfigFile}\\\"",
+            "--v=1",
+            "--proxy-mode=kernelspace",
+            $"--hostname-override=\\\"{privateDnsName}\\\"",
+            $"--cluster-cidr=\\\"{vpcCIDRRange}\\\"",
+            kubeProxyExtraArgs ?? string.Empty
+        });
 
         var kubeProxyTask = Task.Run(() =>
         {
-            using var process = Process.Start(new ProcessStartInfo("sc.exe")
-            {
-                Arguments = $"create {kubeProxyServiceName} binPath= \"\\\"{serviceHostExe}\\\" {kubeProxyServiceName} \\\"{kubeproxy}\\\" {kubeProxyArgs}\" start= demand",
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            });
-            process?.WaitForExit();
-            using var configure = Process.Start("sc.exe", $"failure {kubeProxyServiceName} reset={SERVICE_FAILURE_COUNT_RESET_SEC} actions=\"restart/{SERVICE_FAILURE_FIRST_DELAY_MS} + /restart/{SERVICE_FAILURE_SECOND_DELAY_MS} + /restart/{SERVICE_FAILURE_THIRD_DELAY_MS}\"");
-            configure?.WaitForExit();
-            using var failure = Process.Start("sc.exe", $"failureflag {kubeProxyServiceName} 1");
-            failure?.WaitForExit();
-        });
+            RunScCreate(ServiceNameKubeProxy, $"\\\"{serviceHostExe}\\\" {ServiceNameKubeProxy} \\\"{kubeproxy}\\\" {kubeProxyArgs}");
+            RunScFailure(ServiceNameKubeProxy);
+            RunScFailureFlag(ServiceNameKubeProxy);
+        }, cancellationToken);
+
         await Task.WhenAll(kubeletTask, kubeProxyTask);
+    }
+
+    static void RunScCreate(string serviceName, string binPathArgs)
+    {
+        using var process = Process.Start(new ProcessStartInfo("sc.exe")
+        {
+            Arguments = $"create \"{serviceName}\" binPath= \"{binPathArgs}\" start= demand",
+            UseShellExecute = false,
+            CreateNoWindow = true
+        });
+        process?.WaitForExit();
+    }
+
+    static void RunScFailure(string serviceName)
+    {
+        using var process = Process.Start("sc.exe", $"failure {serviceName} reset={SERVICE_FAILURE_COUNT_RESET_SEC} actions=\"restart/{SERVICE_FAILURE_FIRST_DELAY_MS} + /restart/{SERVICE_FAILURE_SECOND_DELAY_MS} + /restart/{SERVICE_FAILURE_THIRD_DELAY_MS}\"");
+        process?.WaitForExit();
+    }
+
+    static void RunScFailureFlag(string serviceName)
+    {
+        using var process = Process.Start("sc.exe", $"failureflag {serviceName} 1");
+        process?.WaitForExit();
     }
 
     async Task GenerateResolvConf()
     {
-        string resolvDir = @"c:\etc";
-        string resolvFile = Path.Combine(resolvDir, "resolv.conf");
+        string resolvFile = Path.Combine(ResolvDirectory, "resolv.conf");
 
-        // Creating resolv dir, if it doesn't exist
-        if (!Directory.Exists(resolvDir))
+        if (!Directory.Exists(ResolvDirectory))
         {
-            _logger.LogInformation($"Creating resolv directory: {resolvDir}");
-            Directory.CreateDirectory(resolvDir);
+            _logger.LogInformation("Creating resolv directory: {ResolvDir}", ResolvDirectory);
+            Directory.CreateDirectory(ResolvDirectory);
         }
 
         // Getting unique comma separated Dns servers from the Ipv4 network interfaces (AddressFamily 2 represents IPv4)
@@ -430,11 +474,11 @@ public class BootstrapperService : BackgroundService
             .Distinct()
             .ToArray();
 
-        string resolvContent = $"nameserver {string.Join(",", dnsServers)}";
+        string resolvContent = string.Join(Environment.NewLine, dnsServers.Select(s => $"nameserver {s}"));
         await File.WriteAllTextAsync(resolvFile, resolvContent, Encoding.ASCII);
     }
 
-    async Task ExecutePowershellScript(string filePath)
+    async Task ExecutePowershellScript(string filePath, CancellationToken cancellationToken)
     {
         var scriptPath = Path.Combine(Environment.CurrentDirectory, filePath);
         using var process = Process.Start(new ProcessStartInfo("powershell.exe")
@@ -444,113 +488,73 @@ public class BootstrapperService : BackgroundService
             UseShellExecute = false,
             CreateNoWindow = true
         });
-        if (process == null) throw new Exception("Failed to start powershell process");
-        await process.WaitForExitAsync();
-        _logger.LogInformation($"Powershell script: {filePath}");
-        _logger.LogInformation($"Powershell script output: {process.StandardOutput.ReadToEnd()}");
+        if (process == null) throw new InvalidOperationException("Failed to start powershell process");
+        var outputTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+        await process.WaitForExitAsync(cancellationToken);
+        var output = await outputTask;
+        _logger.LogInformation("Powershell script: {FilePath}", filePath);
+        _logger.LogInformation("Powershell script output: {Output}", output);
     }
 
-    async Task StartService(string serviceName)
+    async Task StartService(string serviceName, CancellationToken cancellationToken)
     {
         var process = Process.Start("sc.exe", $"start {serviceName}");
         if (process != null)
         {
-            await process.WaitForExitAsync();
+            await process.WaitForExitAsync(cancellationToken);
         }
     }
 
-    async Task ConfigureHNS()
+    async Task ConfigureHNS(CancellationToken cancellationToken)
     {
         if (string.IsNullOrEmpty(eniMACAddress))
         {
-            throw new ArgumentNullException("EniMACAddress");
+            throw new ArgumentNullException(nameof(eniMACAddress));
         }
 
         var vSwitchName = string.Format("vpcbr{0}", eniMACAddress.Replace(":", ""));
         Environment.SetEnvironmentVariable("KUBE_NETWORK", vSwitchName, EnvironmentVariableTarget.Machine);
-        var netobj = new StringBuilder();
-        netobj.AppendLine("{");
-        netobj.AppendLine("    \"Type\": \"L2Bridge\",");
+        var prefixes = subnetCIDRRange?.Split(',', StringSplitOptions.RemoveEmptyEntries).Select(p => p.Trim()).ToArray() ?? [];
+        var gateways = gatewayIpAddresses?[0]?.Split(',', StringSplitOptions.RemoveEmptyEntries).Select(g => g.Trim()).ToArray() ?? [];
 
-        if (!string.IsNullOrEmpty(vSwitchName))
+        var hnsNetwork = new HnsNetworkRequest
         {
-            netobj.AppendLine($"    \"Name\": \"{vSwitchName}\",");
-        }
-
-        if (!string.IsNullOrEmpty(subnetCIDRRange))
-        {
-            var prefixes = subnetCIDRRange.Split(',');
-            var gateways = gatewayIpAddresses?[0]?.Split(',');
-
-            netobj.AppendLine("    \"Subnets\": [");
-            for (int i = 0; i < prefixes.Length; i++)
+            Type = VpcBridgeNetworkType,
+            Name = vSwitchName,
+            Subnets = prefixes.Select((prefix, i) => new HnsSubnet
             {
-                netobj.AppendLine("        {");
-                netobj.AppendLine($"            \"AddressPrefix\": \"{prefixes[i]}\",");
+                AddressPrefix = prefix,
+                GatewayAddress = i < gateways.Length && !string.IsNullOrEmpty(gateways[i]) ? gateways[i] : null
+            }).ToList()
+        };
 
-                if (gateways != null && i < gateways.Length && !string.IsNullOrEmpty(gateways[i]))
-                {
-                    netobj.AppendLine($"            \"GatewayAddress\": \"{gateways[i]}\"");
-                }
-
-                netobj.AppendLine("        }"); // Remove the comma here
-                if (i < prefixes.Length - 1)
-                {
-                    netobj.AppendLine(",");
-                }
-            }
-            netobj.AppendLine("    ]");
-        }
-
-        netobj.AppendLine("}");
-
-        var jsonString = netobj.ToString();
+        var jsonString = JsonSerializer.Serialize(hnsNetwork, HnsJsonContext.Default.HnsNetworkRequest);
         _logger.LogInformation($"Creating HNS network object: {jsonString}");
-        bool success = false;
-        string response = string.Empty;
-        var stopwatch = Stopwatch.StartNew();
-        while (!success && stopwatch.Elapsed < TimeSpan.FromSeconds(60))
-        {
-            [DllImport("vmcompute.dll")]
-            static extern void HNSCall([MarshalAs(UnmanagedType.LPWStr)] string method,
-                           [MarshalAs(UnmanagedType.LPWStr)] string path,
-                           [MarshalAs(UnmanagedType.LPWStr)] string request,
-                           [MarshalAs(UnmanagedType.LPWStr)] out string response);
-            HNSCall("POST", "/networks", jsonString, out response);
-            _logger.LogInformation($"HNS network object creation response: {response}");
-            var match = Regex.Match(response, "\"Success\":\\s*(true|false)");
-            if (match.Success)
-            {
-                success = bool.Parse(match.Groups[1].Value);
-            }
-            if (!success)
-            {
-                _logger.LogInformation($"HNS network object creation failed, Elapsed {stopwatch.ElapsedMilliseconds}ms, Retrying in 1 second...");
-                await Task.Delay(TimeSpan.FromSeconds(1));
-            }
-        }
+
+        HNSCall("POST", "/networks", jsonString, out string response);
+        _logger.LogInformation($"HNS network object creation response: {response}");
+
+        var match = Regex.Match(response, "\"Success\":\\s*(true|false)");
+        var success = match.Success && bool.Parse(match.Groups[1].Value);
+
         if (!success)
         {
+            _logger.LogError("Failed to create HNS network object");
+            if (_shutdownOnCriticalFailure)
+            {
+                _logger.LogError("ShutdownOnCriticalFailure is enabled - initiating immediate system shutdown.");
+                Process.Start("shutdown.exe", "/s /t 0 /c \"EKS Bootstrapper: HNS network creation failed\"");
+                return;
+            }
             throw new Exception("Failed to create HNS network object");
         }
-        else
-        {
-            _logger.LogInformation($"HNS network object created successfully, Elapsed {stopwatch.ElapsedMilliseconds}ms");
-            _logger.LogInformation($"HNS network object creation response: {response}");
-            await AddRoutesTovNIC();
-        }
+
+        _logger.LogInformation("HNS network object created successfully");
+        await AddRoutesTovNIC(cancellationToken);
     }
 
-    async Task AddRoutesTovNIC()
+    async Task AddRoutesTovNIC(CancellationToken cancellationToken)
     {
-
-        // 169.254.169.254 is for metadata service
-        // 169.254.169.250 is for KmsInstanceVpc1
-        // 169.254.169.251 is for KmsInstanceVpc2
-        // 169.254.169.249 is for G3GridLicense
-        // 169.254.169.123 is for AmzTimeSyncServiceVipIp
-        // 169.254.169.253 is for DNS server
-        string[] ipAddrs = { "169.254.169.254", "169.254.169.250", "169.254.169.251", "169.254.169.249", "169.254.169.123", "169.254.169.253" };
         _logger.LogInformation("Looking for vNIC with Name 'vEthernet*' to add routes");
         var timeout = TimeSpan.FromSeconds(10);
         var interval = TimeSpan.FromMilliseconds(200);
@@ -564,7 +568,11 @@ public class BootstrapperService : BackgroundService
                 vNIC = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(ni => ni.Name.StartsWith("vEthernet"));
                 if (vNIC != null) break;
                 _logger.LogInformation("vNIC for ENI 'vEthernet*' is not available yet to add routes. Time elapsed: {0} ms", stopwatch.ElapsedMilliseconds);
-                await Task.Delay(interval);
+                await Task.Delay(interval, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -581,10 +589,10 @@ public class BootstrapperService : BackgroundService
         var vNICIndex = vNIC.GetIPProperties().GetIPv4Properties().Index;
 
         var routeAddCommands = new StringBuilder();
-        for (int i = 0; i < ipAddrs.Length; i++)
+        for (int i = 0; i < MetadataRouteAddresses.Length; i++)
         {
-            routeAddCommands.Append($"route ADD {ipAddrs[i]} MASK 255.255.255.255 0.0.0.0 IF {vNICIndex}");
-            if (i < ipAddrs.Length - 1)
+            routeAddCommands.Append($"route ADD {MetadataRouteAddresses[i]} MASK 255.255.255.255 0.0.0.0 IF {vNICIndex}");
+            if (i < MetadataRouteAddresses.Length - 1)
             {
                 routeAddCommands.Append(" & ");
             }
@@ -603,4 +611,119 @@ public class BootstrapperService : BackgroundService
         _logger.LogInformation($"Route add commands: {routeAddCommands}");
         _logger.LogInformation($"Route add command output: {process.StandardOutput.ReadToEnd()}");
     }
+}
+
+public class HnsNetworkRequest
+{
+    public required string Type { get; set; }
+    public string? Name { get; set; }
+    public List<HnsSubnet>? Subnets { get; set; }
+}
+
+public class HnsSubnet
+{
+    public required string AddressPrefix { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? GatewayAddress { get; set; }
+}
+
+[JsonSerializable(typeof(HnsNetworkRequest))]
+public partial class HnsJsonContext : JsonSerializerContext
+{
+}
+
+// CNI and kubelet config DTOs for safe JSON serialization (no string interpolation)
+public class CniConfig
+{
+    public string CniVersion { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string Type { get; set; } = "";
+    public CniCapabilities? Capabilities { get; set; }
+    public bool DisableCheck { get; set; }
+    public string EniMACAddress { get; set; } = "";
+    public string[] EniIPAddresses { get; set; } = [];
+    public string? GatewayIPAddress { get; set; }
+    public List<string> VpcCIDRs { get; set; } = [];
+    public string ServiceCIDR { get; set; } = "";
+    public CniDnsConfig? Dns { get; set; }
+}
+
+public class CniCapabilities
+{
+    public bool PortMappings { get; set; }
+}
+
+public class CniDnsConfig
+{
+    public string[] Nameservers { get; set; } = [];
+    public string[] Search { get; set; } = [];
+}
+
+public class KubeletConfiguration
+{
+    public string Kind { get; set; } = "";
+    public string ApiVersion { get; set; } = "";
+    public string Address { get; set; } = "";
+    public KubeletAuthentication? Authentication { get; set; }
+    public KubeletAuthorization? Authorization { get; set; }
+    public string ClusterDomain { get; set; } = "";
+    public string HairpinMode { get; set; } = "";
+    public string CgroupDriver { get; set; } = "";
+    public string CgroupRoot { get; set; } = "";
+    public Dictionary<string, bool>? FeatureGates { get; set; }
+    public bool SerializeImagePulls { get; set; }
+    public bool ServerTLSBootstrap { get; set; }
+    public string[]? ClusterDNS { get; set; }
+}
+
+public class KubeletAuthentication
+{
+    public KubeletAnonymous? Anonymous { get; set; }
+    public KubeletWebhook? Webhook { get; set; }
+    public KubeletX509? X509 { get; set; }
+}
+
+public class KubeletAnonymous
+{
+    public bool Enabled { get; set; }
+}
+
+public class KubeletWebhook
+{
+    public string CacheTTL { get; set; } = "";
+    public bool Enabled { get; set; }
+}
+
+public class KubeletX509
+{
+    public string? ClientCAFile { get; set; }
+}
+
+public class KubeletAuthorization
+{
+    public string Mode { get; set; } = "";
+    public KubeletAuthWebhook? Webhook { get; set; }
+}
+
+public class KubeletAuthWebhook
+{
+    public string CacheAuthorizedTTL { get; set; } = "";
+    public string CacheUnauthorizedTTL { get; set; } = "";
+}
+
+[JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
+[JsonSerializable(typeof(CniConfig))]
+[JsonSerializable(typeof(CniDnsConfig))]
+[JsonSerializable(typeof(CniCapabilities))]
+[JsonSerializable(typeof(KubeletConfiguration))]
+[JsonSerializable(typeof(KubeletAuthentication))]
+[JsonSerializable(typeof(KubeletAnonymous))]
+[JsonSerializable(typeof(KubeletWebhook))]
+[JsonSerializable(typeof(KubeletX509))]
+[JsonSerializable(typeof(KubeletAuthorization))]
+[JsonSerializable(typeof(KubeletAuthWebhook))]
+[JsonSerializable(typeof(Dictionary<string, bool>))]
+public partial class BootstrapperJsonContext : JsonSerializerContext
+{
 }
