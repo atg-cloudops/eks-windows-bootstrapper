@@ -12,7 +12,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="AWSSDK.EC2" Version="4.0.76" />
+    <PackageReference Include="AWSSDK.EC2" Version="4.0.80" />
     <PackageReference Include="AWSSDK.EKS" Version="4.0.13" />
     <PackageReference Include="Microsoft.Extensions.Configuration" Version="10.0.3" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.3" />
