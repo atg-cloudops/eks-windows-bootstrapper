@@ -24,7 +24,7 @@ phases:
         inputs:
           commands:
             - |
-              Invoke-WebRequest -Uri 'https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.34.0/Install-Service.ps1' -OutFile 'Install-Service.ps1'; 
+              Invoke-WebRequest -Uri 'https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.35.0/Install-Service.ps1' -OutFile 'Install-Service.ps1'; 
               .\Install-Service.ps1; 
               Remove-Item 'Install-Service.ps1';
 ```
@@ -59,7 +59,7 @@ To enable this, pass the `-ShutdownOnCriticalFailure` switch when running the in
 Or when using AWS Image Builder:
 
 ```
-Invoke-WebRequest -Uri 'https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.34.0/Install-Service.ps1' -OutFile 'Install-Service.ps1'; 
+Invoke-WebRequest -Uri 'https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.35.0/Install-Service.ps1' -OutFile 'Install-Service.ps1'; 
 .\Install-Service.ps1 -ShutdownOnCriticalFailure; 
 Remove-Item 'Install-Service.ps1';
 ```

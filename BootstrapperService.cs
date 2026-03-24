@@ -12,8 +12,22 @@ using Microsoft.Extensions.Logging;
 
 namespace EKS_Windows_Bootstrapper;
 
-public class BootstrapperService : BackgroundService
+public partial class BootstrapperService(ILogger<BootstrapperService> logger, IConfiguration configuration) : BackgroundService
 {
+    [GeneratedRegex(@"-EKSClusterName\s+(['""])(.*?)\1")]
+    private static partial Regex EKSClusterNameRegex();
+
+    [GeneratedRegex(@"-DNSClusterIP\s+(['""])(.*?)\1")]
+    private static partial Regex DNSClusterIPRegex();
+
+    [GeneratedRegex(@"-KubeletExtraArgs\s+(['""])(.*?)\1")]
+    private static partial Regex KubeletExtraArgsRegex();
+
+    [GeneratedRegex(@"-KubeProxyExtraArgs\s+(['""])(.*?)\1")]
+    private static partial Regex KubeProxyExtraArgsRegex();
+
+    [GeneratedRegex(@"""Success"":\s*(true|false)")]
+    private static partial Regex HNSSuccessRegex();
     private const string ServiceNameKubelet = "kubelet";
     private const string ServiceNameKubeProxy = "kube-proxy";
     private const string ServiceNameContainerd = "containerd";
@@ -39,13 +53,13 @@ public class BootstrapperService : BackgroundService
         [MarshalAs(UnmanagedType.LPWStr)] string request,
         [MarshalAs(UnmanagedType.LPWStr)] out string response);
 
-    readonly bool _shutdownOnCriticalFailure;
-    string? vpcCIDRRange;
+    readonly bool _shutdownOnCriticalFailure = bool.TryParse(configuration["ShutdownOnCriticalFailure"], out var shutdownOnCritical) && shutdownOnCritical;
+    string[]? vpcCIDRRanges;
+    string? vpcCIDR;
     string? subnetCIDRRange;
     string? excludedSnatCIDRsEnvVar;
     string? dnsClusterIP;
     string? apiVersionAuthentication;
-    string? eksPauseImage;
     string? kubeletExtraArgs;
     string? kubeProxyExtraArgs;
     string? cniConfigDir;
@@ -67,18 +81,13 @@ public class BootstrapperService : BackgroundService
     string? internalIp;
     string? eniMACAddress;
     string? clusterName;
+    string? kubeLogLevel;
     string[]? gatewayIpAddresses;
     const int SERVICE_FAILURE_COUNT_RESET_SEC = 300;
     const int SERVICE_FAILURE_FIRST_DELAY_MS = 5000;
     const int SERVICE_FAILURE_SECOND_DELAY_MS = 30000;
     const int SERVICE_FAILURE_THIRD_DELAY_MS = 60000;
-    ILogger<BootstrapperService> _logger;
-
-    public BootstrapperService(ILogger<BootstrapperService> logger, IConfiguration configuration)
-    {
-        _logger = logger;
-        _shutdownOnCriticalFailure = bool.TryParse(configuration["ShutdownOnCriticalFailure"], out var shutdownOnCritical) && shutdownOnCritical;
-    }
+    readonly ILogger<BootstrapperService> _logger = logger;
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("Gathering system configuration...");
@@ -95,7 +104,8 @@ public class BootstrapperService : BackgroundService
                 userData = Amazon.Util.EC2InstanceMetadata.UserData;
                 if (!string.IsNullOrEmpty(userData))
                 {
-                    _logger.LogInformation("Userdata received, took {0} ms", stopwatch.ElapsedMilliseconds);
+                    if (_logger.IsEnabled(LogLevel.Information))
+                        _logger.LogInformation("Userdata received, took {ElapsedMs} ms", stopwatch.ElapsedMilliseconds);
                     break;
                 }
                 await Task.Delay(UserdataPollIntervalMs, stoppingToken);
@@ -106,30 +116,32 @@ public class BootstrapperService : BackgroundService
             }
             catch (Exception ex)
             {
-                _logger.LogError($"An error occurred while retrieving userdata: {ex.Message}, Retrying...");
+                _logger.LogError(ex, "An error occurred while retrieving userdata, Retrying...");
             }
         }
         stopwatch.Stop();
-        _logger.LogInformation($"Userdata: {userData}");
+        if (_logger.IsEnabled(LogLevel.Information))
+            _logger.LogInformation("Userdata: {UserData}", userData);
         if (string.IsNullOrEmpty(userData))
         {
             _logger.LogError("Userdata is empty, exiting...");
             return;
         }
 
-        clusterName = Regex.Match(userData, "-EKSClusterName\\s+(['\"])(.*?)\\1")?.Groups[2]?.Value ?? throw new ArgumentException("Cluster name was not found in userdata, exiting");
-        dnsClusterIP = Regex.Match(userData, "-DNSClusterIP\\s+(['\"])(.*?)\\1")?.Groups[2]?.Value ?? throw new ArgumentException("DnsClusterIP was not found in userdata, exiting");
-        kubeletExtraArgs = Regex.Match(userData, "-KubeletExtraArgs\\s+(['\"])(.*?)\\1")?.Groups[2]?.Value ?? string.Empty;
-        kubeProxyExtraArgs = Regex.Match(userData, "-KubeProxyExtraArgs\\s+(['\"])(.*?)\\1")?.Groups[2]?.Value ?? string.Empty;
+        clusterName = EKSClusterNameRegex().Match(userData)?.Groups[2]?.Value ?? throw new ArgumentException("Cluster name was not found in userdata, exiting");
+        dnsClusterIP = DNSClusterIPRegex().Match(userData)?.Groups[2]?.Value ?? throw new ArgumentException("DnsClusterIP was not found in userdata, exiting");
+        kubeletExtraArgs = KubeletExtraArgsRegex().Match(userData)?.Groups[2]?.Value ?? string.Empty;
+        kubeProxyExtraArgs = KubeProxyExtraArgsRegex().Match(userData)?.Groups[2]?.Value ?? string.Empty;
 
-        _logger.LogInformation($"Extracted parameters: ClusterName: {clusterName}, DnsClusterIP: {dnsClusterIP}, KubeletExtraArgs: {kubeletExtraArgs}, KubeProxyExtraArgs: {kubeProxyExtraArgs}");
+        if (_logger.IsEnabled(LogLevel.Information))
+            _logger.LogInformation("Extracted parameters: ClusterName: {ClusterName}, DnsClusterIP: {DnsClusterIP}, KubeletExtraArgs: {KubeletExtraArgs}, KubeProxyExtraArgs: {KubeProxyExtraArgs}",
+                clusterName, dnsClusterIP, kubeletExtraArgs, kubeProxyExtraArgs);
 
         var programFilesDirectory = Environment.GetEnvironmentVariable("ProgramFiles") ?? "C:\\Program Files";
         var programDataDirectory = Environment.GetEnvironmentVariable("ProgramData") ?? "C:\\ProgramData";
         var startScript = Environment.GetEnvironmentVariable("EKS_BOOTSTRAPPER_START_SCRIPT") ?? null;
         apiVersionAuthentication = Environment.GetEnvironmentVariable("API_VERSION_AUTHENTICATION") ?? "client.authentication.k8s.io/v1beta1";
 
-        eksPauseImage = Environment.GetEnvironmentVariable("EKS_PAUSE_IMAGE") ?? "amazonaws.com/eks/pause-windows:latest";
         // This program starts with windows services on EC2 to bootstrap a EKS windows node
         // It waits for userdata to become available and then extracts the necessary information to join the EKS cluster from the pwsh command
         // It then prepares the node and starts the kubernetes components.
@@ -157,6 +169,12 @@ public class BootstrapperService : BackgroundService
 
         // User defined environment variables
         excludedSnatCIDRsEnvVar = Environment.GetEnvironmentVariable("EXCLUDED_SNAT_CIDRS", EnvironmentVariableTarget.Machine); // e.g. '172.40.0.0/24,192.168.40.0/24'
+        var serviceIpv4CIDREnvVar = Environment.GetEnvironmentVariable("SERVICE_IPV4_CIDR", EnvironmentVariableTarget.Machine); // e.g. '10.100.0.0/16'
+
+        var envLogLevel = Environment.GetEnvironmentVariable("EKSKUBELOGLEVEL", EnvironmentVariableTarget.Machine);
+        kubeLogLevel = int.TryParse(envLogLevel, out var parsedLevel) && parsedLevel >= 1 && parsedLevel <= 8
+            ? envLogLevel!
+            : "1";
 
         var instanceId = Amazon.Util.EC2InstanceMetadata.InstanceId;
         var ec2Client = new Amazon.EC2.AmazonEC2Client();
@@ -166,24 +184,38 @@ public class BootstrapperService : BackgroundService
         var instanceInfoTask = DescribeInstancesWithRetryAsync(ec2Client, instanceId, stoppingToken);
         region = Amazon.Util.EC2InstanceMetadata.Region.SystemName;
         eniMACAddress = Amazon.Util.EC2InstanceMetadata.GetData("/mac");
-        vpcCIDRRange = Amazon.Util.EC2InstanceMetadata.GetData($"/network/interfaces/macs/{eniMACAddress}/vpc-ipv4-cidr-block");
+        vpcCIDRRanges = Amazon.Util.EC2InstanceMetadata.GetData($"/network/interfaces/macs/{eniMACAddress}/vpc-ipv4-cidr-blocks")
+            ?.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        vpcCIDR = Amazon.Util.EC2InstanceMetadata.GetData($"/network/interfaces/macs/{eniMACAddress}/vpc-ipv4-cidr-block");
         subnetCIDRRange = Amazon.Util.EC2InstanceMetadata.GetData($"/network/interfaces/macs/{eniMACAddress}/subnet-ipv4-cidr-block");
         var subnetParts = subnetCIDRRange?.Split("/", 2, StringSplitOptions.None);
         if (subnetParts == null || subnetParts.Length != 2)
-            throw new ArgumentException("Subnet CIDR range was not found or invalid in instance metadata (expected format: prefix/maskBits).", nameof(subnetCIDRRange));
+            throw new ArgumentException("Subnet CIDR range was not found or invalid in instance metadata (expected format: prefix/maskBits).");
         subnetMaskBits = subnetParts[1];
         internalIp = Amazon.Util.EC2InstanceMetadata.PrivateIpAddress;
 
         var cluster = await clusterTask;
         clusterEndpoint = cluster.Cluster.Endpoint;
         clusterCertificateAuthorityData = cluster.Cluster.CertificateAuthority.Data;
-        serviceCIDR = cluster.Cluster.KubernetesNetworkConfig.ServiceIpv4Cidr ?? "10.100.0.0/16";
-        gatewayIpAddresses = GetGatewayIpAddresses().ToArray();
+        if (!string.IsNullOrEmpty(serviceIpv4CIDREnvVar))
+        {
+            serviceCIDR = serviceIpv4CIDREnvVar;
+        }
+        else if (!string.IsNullOrEmpty(cluster.Cluster.KubernetesNetworkConfig.ServiceIpv4Cidr))
+        {
+            serviceCIDR = cluster.Cluster.KubernetesNetworkConfig.ServiceIpv4Cidr;
+        }
+        else
+        {
+            serviceCIDR = vpcCIDRRanges?.Any(c => c.StartsWith("10.")) == true ? "172.20.0.0/16" : "10.100.0.0/16";
+        }
+        gatewayIpAddresses = [.. GetGatewayIpAddresses()];
         var instanceInfo = await instanceInfoTask;
         privateDnsName = instanceInfo.Reservations[0].Instances[0].PrivateDnsName;
 
         stopWatch.Stop();
-        _logger.LogInformation($"Gathered system configuration in {stopWatch.ElapsedMilliseconds} ms");
+        if (_logger.IsEnabled(LogLevel.Information))
+            _logger.LogInformation("Gathered system configuration in {ElapsedMs} ms", stopWatch.ElapsedMilliseconds);
         stopWatch.Reset();
 
         _logger.LogInformation("Configuring EKS Windows Node");
@@ -203,7 +235,8 @@ public class BootstrapperService : BackgroundService
         );
 
         stopWatch.Stop();
-        _logger.LogInformation($"EKS Windows Node Configured in {stopWatch.ElapsedMilliseconds} ms");
+        if (_logger.IsEnabled(LogLevel.Information))
+            _logger.LogInformation("EKS Windows Node Configured in {ElapsedMs} ms", stopWatch.ElapsedMilliseconds);
     }
 
 
@@ -217,7 +250,8 @@ public class BootstrapperService : BackgroundService
             }
             catch (Exception ex) when (attempt < AwsRetryMaxAttempts)
             {
-                _logger.LogWarning(ex, "DescribeCluster attempt {Attempt} failed, retrying in {DelayMs} ms.", attempt, AwsRetryDelayMs);
+                if (_logger.IsEnabled(LogLevel.Warning))
+                    _logger.LogWarning(ex, "DescribeCluster attempt {Attempt} failed, retrying in {DelayMs} ms.", attempt, AwsRetryDelayMs);
                 await Task.Delay(AwsRetryDelayMs, cancellationToken);
             }
         }
@@ -234,14 +268,15 @@ public class BootstrapperService : BackgroundService
             }
             catch (Exception ex) when (attempt < AwsRetryMaxAttempts)
             {
-                _logger.LogWarning(ex, "DescribeInstances attempt {Attempt} failed, retrying in {DelayMs} ms.", attempt, AwsRetryDelayMs);
+                if (_logger.IsEnabled(LogLevel.Warning))
+                    _logger.LogWarning(ex, "DescribeInstances attempt {Attempt} failed, retrying in {DelayMs} ms.", attempt, AwsRetryDelayMs);
                 await Task.Delay(AwsRetryDelayMs, cancellationToken);
             }
         }
         return await ec2Client.DescribeInstancesAsync(new Amazon.EC2.Model.DescribeInstancesRequest { InstanceIds = new List<string> { instanceId } }, cancellationToken);
     }
 
-    IEnumerable<string> GetGatewayIpAddresses()
+    static IEnumerable<string> GetGatewayIpAddresses()
     {
         var netRoutes = NetworkInterface.GetAllNetworkInterfaces();
         foreach (var netRoute in netRoutes)
@@ -260,11 +295,11 @@ public class BootstrapperService : BackgroundService
 
     List<string> GetCombinedSNATExclusionList()
     {
-        if (string.IsNullOrEmpty(vpcCIDRRange))
+        if (vpcCIDRRanges == null || vpcCIDRRanges.Length == 0)
         {
-            throw new ArgumentNullException(nameof(vpcCIDRRange));
+            throw new ArgumentNullException(nameof(vpcCIDRRanges));
         }
-        List<string> combinedCIDRRange = [vpcCIDRRange];
+        List<string> combinedCIDRRange = [..vpcCIDRRanges];
         if (!string.IsNullOrEmpty(excludedSnatCIDRsEnvVar))
         {
             _logger.LogInformation("Excluding environment variable specified CIDR ranges for SNAT in CNI config");
@@ -336,13 +371,13 @@ public class BootstrapperService : BackgroundService
             Capabilities = new CniCapabilities { PortMappings = true },
             DisableCheck = true,
             EniMACAddress = eniMACAddress ?? string.Empty,
-            EniIPAddresses = new[] { $"{internalIp}/{subnetMaskBits}" },
+            EniIPAddresses = [$"{internalIp}/{subnetMaskBits}"],
             GatewayIPAddress = gatewayIpAddresses?.FirstOrDefault(),
             VpcCIDRs = snatExcludedCIDRs,
             ServiceCIDR = serviceCIDR ?? string.Empty,
             Dns = new CniDnsConfig
             {
-                Nameservers = new[] { dnsClusterIP ?? string.Empty },
+                Nameservers = [dnsClusterIP ?? string.Empty],
                 Search = dnsSuffixList
             }
         };
@@ -379,7 +414,7 @@ public class BootstrapperService : BackgroundService
             FeatureGates = new Dictionary<string, bool> { ["RotateKubeletServerCertificate"] = true },
             SerializeImagePulls = false,
             ServerTLSBootstrap = true,
-            ClusterDNS = new[] { dnsClusterIP ?? string.Empty }
+            ClusterDNS = [dnsClusterIP ?? string.Empty]
         };
         var json = JsonSerializer.Serialize(kubeletConfig, BootstrapperJsonContext.Default.KubeletConfiguration);
         await File.WriteAllTextAsync(kubeletConfigFile, json, Encoding.ASCII);
@@ -392,8 +427,7 @@ public class BootstrapperService : BackgroundService
         kubeletArgs.Append(" --cloud-provider=external");
         kubeletArgs.Append(" --kubeconfig=\\\"" + kubeConfigFile + "\\\"");
         kubeletArgs.Append(" --hostname-override=" + privateDnsName);
-        kubeletArgs.Append(" --v=1");
-        kubeletArgs.Append(" --pod-infra-container-image=\\\"" + eksPauseImage + "\\\"");
+        kubeletArgs.Append(" --v=" + kubeLogLevel);
         kubeletArgs.Append(" --resolv-conf=\\\"\\\"");
         kubeletArgs.Append(" --enable-debugging-handlers");
         kubeletArgs.Append(" --cgroups-per-qos=false");
@@ -415,10 +449,10 @@ public class BootstrapperService : BackgroundService
         var kubeProxyArgs = string.Join(" ", new[]
         {
             $"--kubeconfig=\\\"{kubeConfigFile}\\\"",
-            "--v=1",
+            $"--v={kubeLogLevel}",
             "--proxy-mode=kernelspace",
             $"--hostname-override=\\\"{privateDnsName}\\\"",
-            $"--cluster-cidr=\\\"{vpcCIDRRange}\\\"",
+            $"--cluster-cidr=\\\"{vpcCIDR}\\\"",
             kubeProxyExtraArgs ?? string.Empty
         });
 
@@ -461,7 +495,8 @@ public class BootstrapperService : BackgroundService
 
         if (!Directory.Exists(ResolvDirectory))
         {
-            _logger.LogInformation("Creating resolv directory: {ResolvDir}", ResolvDirectory);
+            if (_logger.IsEnabled(LogLevel.Information))
+                _logger.LogInformation("Creating resolv directory: {ResolvDir}", ResolvDirectory);
             Directory.CreateDirectory(ResolvDirectory);
         }
 
@@ -492,11 +527,14 @@ public class BootstrapperService : BackgroundService
         var outputTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
         await process.WaitForExitAsync(cancellationToken);
         var output = await outputTask;
-        _logger.LogInformation("Powershell script: {FilePath}", filePath);
-        _logger.LogInformation("Powershell script output: {Output}", output);
+        if (_logger.IsEnabled(LogLevel.Information))
+        {
+            _logger.LogInformation("Powershell script: {FilePath}", filePath);
+            _logger.LogInformation("Powershell script output: {Output}", output);
+        }
     }
 
-    async Task StartService(string serviceName, CancellationToken cancellationToken)
+    static async Task StartService(string serviceName, CancellationToken cancellationToken)
     {
         var process = Process.Start("sc.exe", $"start {serviceName}");
         if (process != null)
@@ -509,7 +547,7 @@ public class BootstrapperService : BackgroundService
     {
         if (string.IsNullOrEmpty(eniMACAddress))
         {
-            throw new ArgumentNullException(nameof(eniMACAddress));
+            throw new InvalidOperationException("eniMACAddress must be set before configuring HNS.");
         }
 
         var vSwitchName = string.Format("vpcbr{0}", eniMACAddress.Replace(":", ""));
@@ -529,12 +567,14 @@ public class BootstrapperService : BackgroundService
         };
 
         var jsonString = JsonSerializer.Serialize(hnsNetwork, HnsJsonContext.Default.HnsNetworkRequest);
-        _logger.LogInformation($"Creating HNS network object: {jsonString}");
+        if (_logger.IsEnabled(LogLevel.Information))
+            _logger.LogInformation("Creating HNS network object: {JsonString}", jsonString);
 
         HNSCall("POST", "/networks", jsonString, out string response);
-        _logger.LogInformation($"HNS network object creation response: {response}");
+        if (_logger.IsEnabled(LogLevel.Information))
+            _logger.LogInformation("HNS network object creation response: {Response}", response);
 
-        var match = Regex.Match(response, "\"Success\":\\s*(true|false)");
+        var match = HNSSuccessRegex().Match(response);
         var success = match.Success && bool.Parse(match.Groups[1].Value);
 
         if (!success)
@@ -567,7 +607,8 @@ public class BootstrapperService : BackgroundService
             {
                 vNIC = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(ni => ni.Name.StartsWith("vEthernet"));
                 if (vNIC != null) break;
-                _logger.LogInformation("vNIC for ENI 'vEthernet*' is not available yet to add routes. Time elapsed: {0} ms", stopwatch.ElapsedMilliseconds);
+                if (_logger.IsEnabled(LogLevel.Information))
+                    _logger.LogInformation("vNIC for ENI 'vEthernet*' is not available yet to add routes. Time elapsed: {ElapsedMs} ms", stopwatch.ElapsedMilliseconds);
                 await Task.Delay(interval, cancellationToken);
             }
             catch (OperationCanceledException)
@@ -599,17 +640,20 @@ public class BootstrapperService : BackgroundService
         }
 
         // Execute the route add commands using System.Diagnostics.Process
-        Process process = new Process();
+        Process process = new();
         process.StartInfo.FileName = "cmd.exe";
         process.StartInfo.Arguments = $"/C {routeAddCommands}";
         process.StartInfo.RedirectStandardOutput = true;
         process.StartInfo.UseShellExecute = false;
         process.StartInfo.CreateNoWindow = true;
         process.Start();
-        await process.WaitForExitAsync();
-        _logger.LogInformation($"Added routes to vNIC: {vNIC.Name}");
-        _logger.LogInformation($"Route add commands: {routeAddCommands}");
-        _logger.LogInformation($"Route add command output: {process.StandardOutput.ReadToEnd()}");
+        await process.WaitForExitAsync(cancellationToken);
+        if (_logger.IsEnabled(LogLevel.Information))
+        {
+            _logger.LogInformation("Added routes to vNIC: {VNICName}", vNIC.Name);
+            _logger.LogInformation("Route add commands: {RouteAddCommands}", routeAddCommands);
+            _logger.LogInformation("Route add command output: {Output}", process.StandardOutput.ReadToEnd());
+        }
     }
 }
 
