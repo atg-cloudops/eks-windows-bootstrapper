@@ -13,7 +13,7 @@
 
   <ItemGroup>
     <PackageReference Include="AWSSDK.EC2" Version="4.0.82" />
-    <PackageReference Include="AWSSDK.EKS" Version="4.0.14.2" />
+    <PackageReference Include="AWSSDK.EKS" Version="4.0.15.1" />
     <PackageReference Include="Microsoft.Extensions.Configuration" Version="10.0.5" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.5" />
   </ItemGroup>
