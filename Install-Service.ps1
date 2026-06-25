@@ -3,6 +3,8 @@ param(
     [switch]$SkipSsmConfiguration,
     [switch]$ShutdownOnCriticalFailure
 )
+$ErrorActionPreference = 'Stop'
+
 Write-Host "EKS Windows Bootstrapper Installation Script Started at $(Get-Date -Format "yyyy-MM-ddTHH:mm:ss")"
 
 #Download the bootstrapper
