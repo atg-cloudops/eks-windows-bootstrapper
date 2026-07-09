@@ -9,7 +9,10 @@ The EKS Windows Bootstrapper is a fast and efficient tool for bootstrapping Wind
 - Easy to use and configure
 
 ## Installation
-Use AWS Image Builder to create a custom AMI with the boostrapper installed. You can use the AMIs in a Karpenter Ec2NodeClass.
+
+Use AWS Image Builder to create a custom AMI with the bootstrapper installed. The resulting AMI can be used with Karpenter (`Ec2NodeClass`) or the cluster autoscaler.
+
+Create an Image Builder component with the following content and add it to your EKS Windows node recipe. The install script fails the build if downloads or service registration fail, so a GitHub outage or missing artifact will not produce a broken AMI.
 
 ```
 name: Install EKS Windows Bootstrapper
@@ -21,16 +24,18 @@ phases:
     steps:
       - name: InstallEksWindowsBootstrapper
         action: ExecutePowerShell
+        onFailure: Abort
         inputs:
           commands:
             - |
-              Invoke-WebRequest -Uri 'https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.35.0/Install-Service.ps1' -OutFile 'Install-Service.ps1'; 
-              .\Install-Service.ps1; 
-              Remove-Item 'Install-Service.ps1';
+              $ErrorActionPreference = 'Stop'
+              $ReleaseUrl = 'https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.36.0'
+              Invoke-WebRequest -Uri "$ReleaseUrl/Install-Service.ps1" -OutFile 'Install-Service.ps1' -UseBasicParsing
+              .\Install-Service.ps1 -ReleaseUrl $ReleaseUrl -ShutdownOnCriticalFailure
+              Remove-Item 'Install-Service.ps1'
 ```
-Create a new AWS Image builder component with the above content and apply this component to your AWS EKS Windows node recipe.
 
-The output AMI can be used with karpenter or regular cluster autoscaler. No further setup is needed.
+Update the `$ReleaseUrl` version when you adopt a newer bootstrapper release. No further node setup is required after the AMI is built.
 
 ### Update Unattend.xml
 
@@ -50,27 +55,20 @@ By default, if the bootstrapper encounters a critical failure (e.g. HNS network 
 
 Enabling `ShutdownOnCriticalFailure` causes the node to immediately shut itself down on a critical failure instead. When using Karpenter, this is the recommended setting — Karpenter's default behaviour is to delete and recreate a node if the underlying instance is shut down, which effectively gives the bootstrap process another attempt on a fresh node.
 
-To enable this, pass the `-ShutdownOnCriticalFailure` switch when running the install script:
+The Image Builder example above enables this with `-ShutdownOnCriticalFailure`. If you run the install script manually:
 
 ```
 .\Install-Service.ps1 -ShutdownOnCriticalFailure
 ```
 
-Or when using AWS Image Builder:
-
-```
-Invoke-WebRequest -Uri 'https://github.com/atg-cloudops/eks-windows-bootstrapper/releases/download/v1.35.0/Install-Service.ps1' -OutFile 'Install-Service.ps1'; 
-.\Install-Service.ps1 -ShutdownOnCriticalFailure; 
-Remove-Item 'Install-Service.ps1';
-```
-
-Alternatively, you can enable it manually by setting `ShutdownOnCriticalFailure` to `"true"` in `appsettings.json`:
+Alternatively, set `ShutdownOnCriticalFailure` to `"true"` in `appsettings.json`:
 
 ```json
 {
     "ShutdownOnCriticalFailure": "true"
 }
 ```
+
 
 #### View Logs
 If you have access to the node, you can view the boostrapper logs with (in powershell):
